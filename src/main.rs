@@ -13,13 +13,15 @@ use std::{
     env,
     fs::File,
     io::{self, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
+use id3::{Tag, TagLike};
 
 struct Track {
     path: PathBuf,
+    title: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +159,7 @@ fn collect_tracks(args: &Args) -> Result<Vec<Track>> {
     if args.path.is_file() {
         return Ok(vec![Track {
             path: args.path.to_path_buf(),
+            title: read_title(&args.path),
         }]);
     }
 
@@ -169,7 +172,10 @@ fn collect_tracks(args: &Args) -> Result<Vec<Track>> {
                 .map(|s| s.eq_ignore_ascii_case("mp3"))
                 .unwrap_or(false)
             {
-                tracks.push(Track { path: p.into() });
+                tracks.push(Track {
+                    path: p.into(),
+                    title: read_title(p),
+                });
             }
         }
     }
@@ -196,6 +202,16 @@ fn sort_tracks(tracks: &mut [Track], sort: SortKey, reverse: bool) {
     }
     if reverse {
         tracks.reverse();
+    }
+}
+
+fn read_title(path: &Path) -> Option<String> {
+    let tag = Tag::read_from_path(path).ok()?;
+    let title = tag.title()?.trim().to_string();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
     }
 }
 
@@ -297,11 +313,11 @@ fn draw_ui(f: &mut Frame, state: &PlayerState) {
 
     let track = &state.tracks[state.current];
     let status = if state.paused { "Paused" } else { "Playing" };
-    let now_playing = format!(
-        "{}: {}",
-        status,
-        track.path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
-    );
+    let display_title = track
+        .title
+        .as_deref()
+        .unwrap_or_else(|| track.path.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
+    let now_playing = format!("{}: {}", status, display_title);
     let now = Paragraph::new(now_playing).block(Block::default().borders(Borders::ALL));
     f.render_widget(now, chunks[1]);
 
@@ -331,7 +347,10 @@ fn draw_ui(f: &mut Frame, state: &PlayerState) {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let name = t.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+            let name = t
+                .title
+                .as_deref()
+                .unwrap_or_else(|| t.path.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
             let prefix = if i == state.current { "▶ " } else { "  " };
             ListItem::new(format!("{}{}", prefix, name))
         })

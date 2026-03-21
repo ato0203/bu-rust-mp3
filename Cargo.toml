@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 crossterm = "0.27"
+id3 = "1.13"
 ratatui = "0.26"
 rodio = "0.20"
 walkdir = "2.5"
