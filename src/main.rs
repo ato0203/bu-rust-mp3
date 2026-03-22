@@ -1,15 +1,19 @@
 use anyhow::{Context, Result};
+use base64::Engine;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     cursor,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use id3::{Tag, TagLike};
+use image::ImageFormat;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
 };
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use std::io::Write;
 use std::{
     env,
     fs::File,
@@ -18,10 +22,6 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
-use id3::{Tag, TagLike};
-use base64::Engine;
-use image::ImageFormat;
-use std::io::Write;
 
 struct Track {
     path: PathBuf,
@@ -160,14 +160,10 @@ fn main() -> Result<()> {
                         KeyCode::Char('s') => resort_playlist(&mut state, SortKey::Path),
                         KeyCode::Char('r') => toggle_reverse(&mut state),
                         KeyCode::Char('k') => state.force_kitty = !state.force_kitty,
-                        KeyCode::Char('1')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.ui_mode = UiMode::Playlist;
                         }
-                        KeyCode::Char('2')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.ui_mode = UiMode::NowPlaying;
                         }
                         KeyCode::F(1) => state.ui_mode = UiMode::Playlist,
@@ -210,9 +206,7 @@ fn parse_args() -> Result<Args> {
             }
             "--reverse" => reverse = true,
             "--sort" => {
-                let key = args_iter
-                    .next()
-                    .context("Missing value for --sort")?;
+                let key = args_iter.next().context("Missing value for --sort")?;
                 sort = match key.as_str() {
                     "path" => SortKey::Path,
                     "name" => SortKey::Name,
@@ -233,7 +227,11 @@ fn parse_args() -> Result<Args> {
     }
 
     let path = path.context("Usage: bu-rust-mp3 [--sort path|name|mtime|title|artist|album] [--reverse] <file.mp3|directory>")?;
-    Ok(Args { path, sort, reverse })
+    Ok(Args {
+        path,
+        sort,
+        reverse,
+    })
 }
 
 fn collect_tracks(args: &Args) -> Result<Vec<Track>> {
@@ -313,7 +311,7 @@ fn read_meta(path: &Path) -> TrackMeta {
                 artist: None,
                 album: None,
                 art_png: None,
-            }
+            };
         }
     };
     let art_png = extract_cover_png(&tag);
@@ -365,7 +363,9 @@ fn extract_cover_png(tag: &Tag) -> Option<Vec<u8>> {
 }
 
 fn print_usage() {
-    println!("Usage: bu-rust-mp3 [--sort path|name|mtime|title|artist|album] [--reverse] <file.mp3|directory>");
+    println!(
+        "Usage: bu-rust-mp3 [--sort path|name|mtime|title|artist|album] [--reverse] <file.mp3|directory>"
+    );
     println!("Sort defaults to path. Use --reverse to invert order.");
 }
 
@@ -477,10 +477,13 @@ fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
 
     let track = &state.tracks[state.current];
     let status = if state.paused { "Paused" } else { "Playing" };
-    let display_title = track
-        .title
-        .as_deref()
-        .unwrap_or_else(|| track.path.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
+    let display_title = track.title.as_deref().unwrap_or_else(|| {
+        track
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+    });
     let now_playing = format!("{}: {}", status, display_title);
     let now = Paragraph::new(now_playing).block(Block::default().borders(Borders::ALL));
     f.render_widget(now, chunks[1]);
@@ -489,7 +492,7 @@ fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
     let gauge = if let Some(total) = state.total_duration {
         let ratio = (elapsed.as_secs_f64() / total.as_secs_f64()).min(1.0);
         Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title("Progress"))
+            .block(Block::default().borders(Borders::ALL))
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(ratio)
             .label(format!(
@@ -499,7 +502,7 @@ fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
             ))
     } else {
         Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title("Progress"))
+            .block(Block::default().borders(Borders::ALL))
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(0.0)
             .label(format!("{}", fmt_duration(elapsed)))
@@ -558,10 +561,13 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
 
     let track = &state.tracks[state.current];
     let status = if state.paused { "Paused" } else { "Playing" };
-    let display_title = track
-        .title
-        .as_deref()
-        .unwrap_or_else(|| track.path.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
+    let display_title = track.title.as_deref().unwrap_or_else(|| {
+        track
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+    });
     let artist = track.artist.as_deref().unwrap_or("-");
     let album = track.album.as_deref().unwrap_or("-");
     let art_status = if track.art_png.is_some() {
@@ -590,9 +596,7 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
     f.render_widget(art_block, chunks[2]);
 
     let use_kitty = (supports_kitty || state.force_kitty) && track.art_png.is_some();
-    let square = art_inner
-        .width
-        .min(art_inner.height);
+    let square = art_inner.width.min(art_inner.height);
     let art_rect = center_rect(art_inner, square, square);
     if !use_kitty {
         if let Some(png) = track.art_png.as_deref() {
@@ -613,7 +617,7 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
     let gauge = if let Some(total) = state.total_duration {
         let ratio = (elapsed.as_secs_f64() / total.as_secs_f64()).min(1.0);
         Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title("Progress"))
+            .block(Block::default().borders(Borders::ALL))
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(ratio)
             .label(format!(
@@ -623,7 +627,7 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
             ))
     } else {
         Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title("Progress"))
+            .block(Block::default().borders(Borders::ALL))
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(0.0)
             .label(format!("{}", fmt_duration(elapsed)))
@@ -645,11 +649,7 @@ fn resort_playlist(state: &mut PlayerState, sort: SortKey) {
     let current_path = state.tracks[state.current].path.clone();
     state.sort_key = sort;
     sort_tracks(&mut state.tracks, state.sort_key, state.sort_reverse);
-    if let Some(idx) = state
-        .tracks
-        .iter()
-        .position(|t| t.path == current_path)
-    {
+    if let Some(idx) = state.tracks.iter().position(|t| t.path == current_path) {
         state.current = idx;
     }
 }
@@ -658,11 +658,7 @@ fn toggle_reverse(state: &mut PlayerState) {
     let current_path = state.tracks[state.current].path.clone();
     state.sort_reverse = !state.sort_reverse;
     sort_tracks(&mut state.tracks, state.sort_key, state.sort_reverse);
-    if let Some(idx) = state
-        .tracks
-        .iter()
-        .position(|t| t.path == current_path)
-    {
+    if let Some(idx) = state.tracks.iter().position(|t| t.path == current_path) {
         state.current = idx;
     }
 }
@@ -683,7 +679,12 @@ fn center_rect(area: Rect, width: u16, height: u16) -> Rect {
     let h = height.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    Rect { x, y, width: w, height: h }
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }
 
 fn supports_kitty() -> bool {
