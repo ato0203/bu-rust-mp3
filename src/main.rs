@@ -365,9 +365,11 @@ fn draw_ui(f: &mut Frame, state: &PlayerState) {
         .split(size);
 
     let title = format!(
-        "bu-rust-mp3  |  {} / {}",
+        "bu-rust-mp3  |  {} / {}  |  sort: {}{}",
         state.current + 1,
-        state.tracks.len()
+        state.tracks.len(),
+        sort_key_label(state.sort_key),
+        if state.sort_reverse { " (rev)" } else { "" }
     );
     let header = Paragraph::new(title).block(Block::default().borders(Borders::ALL));
     f.render_widget(header, chunks[0]);
@@ -448,6 +450,17 @@ fn toggle_reverse(state: &mut PlayerState) {
         .position(|t| t.path == current_path)
     {
         state.current = idx;
+    }
+}
+
+fn sort_key_label(key: SortKey) -> &'static str {
+    match key {
+        SortKey::Path => "path",
+        SortKey::Name => "name",
+        SortKey::Mtime => "mtime",
+        SortKey::Title => "title",
+        SortKey::Artist => "artist",
+        SortKey::Album => "album",
     }
 }
 
