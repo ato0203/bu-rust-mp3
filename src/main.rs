@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    cursor,
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -18,12 +19,16 @@ use std::{
 };
 use walkdir::WalkDir;
 use id3::{Tag, TagLike};
+use base64::Engine;
+use image::ImageFormat;
+use std::io::Write;
 
 struct Track {
     path: PathBuf,
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
+    art_png: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +39,12 @@ enum SortKey {
     Title,
     Artist,
     Album,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UiMode {
+    Playlist,
+    NowPlaying,
 }
 
 struct Args {
@@ -53,6 +64,15 @@ struct PlayerState {
     stream_handle: OutputStreamHandle,
     sort_key: SortKey,
     sort_reverse: bool,
+    ui_mode: UiMode,
+    force_kitty: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ArtSig {
+    index: usize,
+    width: u16,
+    height: u16,
 }
 
 fn main() -> Result<()> {
@@ -82,6 +102,8 @@ fn main() -> Result<()> {
         stream_handle,
         sort_key: args.sort,
         sort_reverse: args.reverse,
+        ui_mode: UiMode::Playlist,
+        force_kitty: env_force_kitty(),
     };
 
     load_track(&mut state)?;
@@ -89,10 +111,39 @@ fn main() -> Result<()> {
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
 
+    let supports_kitty = supports_kitty();
+    let mut kitty_drawn = false;
+    let mut last_art_sig: Option<ArtSig> = None;
+
     loop {
+        let mut draw_info = DrawInfo::default();
         terminal
-            .draw(|f| draw_ui(f, &state))
+            .draw(|f| {
+                draw_info = draw_ui(f, &state, supports_kitty);
+            })
             .context("draw UI")?;
+
+        if draw_info.use_kitty {
+            if let Some(rect) = draw_info.art_rect {
+                if let Some(png) = state.tracks[state.current].art_png.as_deref() {
+                    let sig = ArtSig {
+                        index: state.current,
+                        width: rect.width,
+                        height: rect.height,
+                    };
+                    if last_art_sig != Some(sig) {
+                        render_kitty_image(terminal.backend_mut(), rect, png)
+                            .context("render kitty image")?;
+                        kitty_drawn = true;
+                        last_art_sig = Some(sig);
+                    }
+                }
+            }
+        } else if kitty_drawn {
+            clear_kitty_image(terminal.backend_mut()).ok();
+            kitty_drawn = false;
+            last_art_sig = None;
+        }
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout).context("poll event")? {
@@ -108,6 +159,19 @@ fn main() -> Result<()> {
                         KeyCode::Char('l') => resort_playlist(&mut state, SortKey::Album),
                         KeyCode::Char('s') => resort_playlist(&mut state, SortKey::Path),
                         KeyCode::Char('r') => toggle_reverse(&mut state),
+                        KeyCode::Char('k') => state.force_kitty = !state.force_kitty,
+                        KeyCode::Char('1')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            state.ui_mode = UiMode::Playlist;
+                        }
+                        KeyCode::Char('2')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            state.ui_mode = UiMode::NowPlaying;
+                        }
+                        KeyCode::F(1) => state.ui_mode = UiMode::Playlist,
+                        KeyCode::F(2) => state.ui_mode = UiMode::NowPlaying,
                         _ => {}
                     }
                 }
@@ -180,6 +244,7 @@ fn collect_tracks(args: &Args) -> Result<Vec<Track>> {
             title: meta.title,
             artist: meta.artist,
             album: meta.album,
+            art_png: meta.art_png,
         }]);
     }
 
@@ -198,6 +263,7 @@ fn collect_tracks(args: &Args) -> Result<Vec<Track>> {
                     title: meta.title,
                     artist: meta.artist,
                     album: meta.album,
+                    art_png: meta.art_png,
                 });
             }
         }
@@ -235,6 +301,7 @@ struct TrackMeta {
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
+    art_png: Option<Vec<u8>>,
 }
 
 fn read_meta(path: &Path) -> TrackMeta {
@@ -245,13 +312,16 @@ fn read_meta(path: &Path) -> TrackMeta {
                 title: None,
                 artist: None,
                 album: None,
+                art_png: None,
             }
         }
     };
+    let art_png = extract_cover_png(&tag);
     TrackMeta {
         title: clean_opt(tag.title()),
         artist: clean_opt(tag.artist()),
         album: clean_opt(tag.album()),
+        art_png,
     }
 }
 
@@ -273,6 +343,24 @@ fn meta_key(value: Option<&str>, path: &Path) -> String {
             .to_ascii_lowercase()
     } else {
         v.to_ascii_lowercase()
+    }
+}
+
+fn extract_cover_png(tag: &Tag) -> Option<Vec<u8>> {
+    let pic = tag
+        .pictures()
+        .find(|p| p.picture_type == id3::frame::PictureType::CoverFront)
+        .or_else(|| tag.pictures().next())?;
+
+    let img = image::load_from_memory(&pic.data).ok()?;
+    let mut png = Vec::new();
+    if img
+        .write_to(&mut io::Cursor::new(&mut png), ImageFormat::Png)
+        .is_ok()
+    {
+        Some(png)
+    } else {
+        None
     }
 }
 
@@ -347,7 +435,20 @@ fn current_elapsed(state: &PlayerState) -> Duration {
     }
 }
 
-fn draw_ui(f: &mut Frame, state: &PlayerState) {
+#[derive(Default)]
+struct DrawInfo {
+    art_rect: Option<Rect>,
+    use_kitty: bool,
+}
+
+fn draw_ui(f: &mut Frame, state: &PlayerState, supports_kitty: bool) -> DrawInfo {
+    match state.ui_mode {
+        UiMode::Playlist => draw_playlist(f, state),
+        UiMode::NowPlaying => draw_now_playing(f, state, supports_kitty),
+    }
+}
+
+fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
     let size = f.size();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -422,9 +523,122 @@ fn draw_ui(f: &mut Frame, state: &PlayerState) {
     f.render_widget(list, chunks[3]);
 
     let help = Paragraph::new(
-        "Controls: space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | q quit",
+        "Controls: space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
     );
     f.render_widget(help, chunks[4]);
+    DrawInfo::default()
+}
+
+fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) -> DrawInfo {
+    let size = f.size();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints(
+            [
+                Constraint::Length(3),
+                Constraint::Length(5),
+                Constraint::Min(5),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ]
+            .as_ref(),
+        )
+        .split(size);
+
+    let title = format!(
+        "bu-rust-mp3  |  {} / {}  |  sort: {}{}",
+        state.current + 1,
+        state.tracks.len(),
+        sort_key_label(state.sort_key),
+        if state.sort_reverse { " (rev)" } else { "" }
+    );
+    let header = Paragraph::new(title).block(Block::default().borders(Borders::ALL));
+    f.render_widget(header, chunks[0]);
+
+    let track = &state.tracks[state.current];
+    let status = if state.paused { "Paused" } else { "Playing" };
+    let display_title = track
+        .title
+        .as_deref()
+        .unwrap_or_else(|| track.path.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
+    let artist = track.artist.as_deref().unwrap_or("-");
+    let album = track.album.as_deref().unwrap_or("-");
+    let art_status = if track.art_png.is_some() {
+        "embedded"
+    } else {
+        "none"
+    };
+    let kitty_status = if supports_kitty || state.force_kitty {
+        if state.force_kitty {
+            "on (forced)"
+        } else {
+            "on"
+        }
+    } else {
+        "off"
+    };
+    let info = format!(
+        "{}\nTitle : {}\nArtist: {}\nAlbum : {}\nArt   : {} | Kitty: {}",
+        status, display_title, artist, album, art_status, kitty_status
+    );
+    let info = Paragraph::new(info).block(Block::default().borders(Borders::ALL));
+    f.render_widget(info, chunks[1]);
+
+    let art_block = Block::default().borders(Borders::ALL).title("Album Art");
+    let art_inner = art_block.inner(chunks[2]);
+    f.render_widget(art_block, chunks[2]);
+
+    let use_kitty = (supports_kitty || state.force_kitty) && track.art_png.is_some();
+    let square = art_inner
+        .width
+        .min(art_inner.height);
+    let art_rect = center_rect(art_inner, square, square);
+    if !use_kitty {
+        if let Some(png) = track.art_png.as_deref() {
+            if let Some(lines) = ascii_art_lines(png, art_rect.width, art_rect.height) {
+                let art = Paragraph::new(lines.join("\n"));
+                f.render_widget(art, art_rect);
+            } else {
+                let art = Paragraph::new("No art").alignment(Alignment::Center);
+                f.render_widget(art, art_rect);
+            }
+        } else {
+            let art = Paragraph::new("No art").alignment(Alignment::Center);
+            f.render_widget(art, art_rect);
+        }
+    }
+
+    let elapsed = current_elapsed(state);
+    let gauge = if let Some(total) = state.total_duration {
+        let ratio = (elapsed.as_secs_f64() / total.as_secs_f64()).min(1.0);
+        Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title("Progress"))
+            .gauge_style(Style::default().fg(Color::Green))
+            .ratio(ratio)
+            .label(format!(
+                "{} / {}",
+                fmt_duration(elapsed),
+                fmt_duration(total)
+            ))
+    } else {
+        Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title("Progress"))
+            .gauge_style(Style::default().fg(Color::Green))
+            .ratio(0.0)
+            .label(format!("{}", fmt_duration(elapsed)))
+    };
+    f.render_widget(gauge, chunks[3]);
+
+    let help = Paragraph::new(
+        "Controls: space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | k kitty | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
+    );
+    f.render_widget(help, chunks[4]);
+
+    DrawInfo {
+        art_rect: Some(art_rect),
+        use_kitty,
+    }
 }
 
 fn resort_playlist(state: &mut PlayerState, sort: SortKey) {
@@ -461,6 +675,112 @@ fn sort_key_label(key: SortKey) -> &'static str {
         SortKey::Title => "title",
         SortKey::Artist => "artist",
         SortKey::Album => "album",
+    }
+}
+
+fn center_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect { x, y, width: w, height: h }
+}
+
+fn supports_kitty() -> bool {
+    if let Ok(v) = env::var("BU_MP3_KITTY") {
+        return v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    if env::var("KITTY_WINDOW_ID").is_ok() {
+        return true;
+    }
+    if let Ok(term) = env::var("TERM") {
+        if term.contains("kitty") || term.contains("ghostty") {
+            return true;
+        }
+    }
+    if env::var("GHOSTTY").is_ok() {
+        return true;
+    }
+    if let Ok(tp) = env::var("TERM_PROGRAM") {
+        if tp.to_ascii_lowercase().contains("ghostty") {
+            return true;
+        }
+    }
+    false
+}
+
+fn env_force_kitty() -> bool {
+    if let Ok(v) = env::var("BU_MP3_KITTY") {
+        return v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    false
+}
+
+fn ascii_art_lines(png: &[u8], width: u16, height: u16) -> Option<Vec<String>> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let img = image::load_from_memory(png).ok()?;
+    let img = img.resize_exact(
+        width as u32,
+        height as u32,
+        image::imageops::FilterType::Nearest,
+    );
+    let luma = img.to_luma8();
+    let ramp = b" .:-=+*#%@";
+    let mut lines = Vec::with_capacity(height as usize);
+    for y in 0..height as u32 {
+        let mut line = String::with_capacity(width as usize);
+        for x in 0..width as u32 {
+            let v = luma.get_pixel(x, y).0[0] as usize;
+            let idx = v * (ramp.len() - 1) / 255;
+            line.push(ramp[idx] as char);
+        }
+        lines.push(line);
+    }
+    Some(lines)
+}
+
+fn render_kitty_image<W: Write>(out: &mut W, rect: Rect, png: &[u8]) -> io::Result<()> {
+    execute!(out, cursor::MoveTo(rect.x, rect.y))?;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+    let mut first = true;
+    let mut remaining = encoded.as_str();
+    while !remaining.is_empty() {
+        let (chunk, rest) = if remaining.len() > 4096 {
+            remaining.split_at(4096)
+        } else {
+            (remaining, "")
+        };
+        remaining = rest;
+        let more = if remaining.is_empty() { 0 } else { 1 };
+        if first {
+            let seq = format!(
+                "\x1b_Gf=100,a=T,c={},r={},i=1,m={};{}\x1b\\",
+                rect.width, rect.height, more, chunk
+            );
+            write_kitty_seq(out, &seq)?;
+            first = false;
+        } else {
+            let seq = format!("\x1b_Gm={};{}\x1b\\", more, chunk);
+            write_kitty_seq(out, &seq)?;
+        }
+    }
+    out.flush()
+}
+
+fn clear_kitty_image<W: Write>(out: &mut W) -> io::Result<()> {
+    write_kitty_seq(out, "\x1b_Ga=d,i=1\x1b\\")?;
+    out.flush()
+}
+
+fn write_kitty_seq<W: Write>(out: &mut W, seq: &str) -> io::Result<()> {
+    if env::var("TMUX").is_ok() {
+        let escaped = seq.replace('\x1b', "\x1b\x1b");
+        write!(out, "\x1bPtmux;{}\x1b\\", escaped)
+    } else {
+        write!(out, "{}", seq)
     }
 }
 
