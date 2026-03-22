@@ -22,6 +22,8 @@ use id3::{Tag, TagLike};
 struct Track {
     path: PathBuf,
     title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -29,6 +31,9 @@ enum SortKey {
     Path,
     Name,
     Mtime,
+    Title,
+    Artist,
+    Album,
 }
 
 struct Args {
@@ -46,6 +51,8 @@ struct PlayerState {
     total_duration: Option<Duration>,
     sink: Sink,
     stream_handle: OutputStreamHandle,
+    sort_key: SortKey,
+    sort_reverse: bool,
 }
 
 fn main() -> Result<()> {
@@ -73,6 +80,8 @@ fn main() -> Result<()> {
         total_duration: None,
         sink,
         stream_handle,
+        sort_key: args.sort,
+        sort_reverse: args.reverse,
     };
 
     load_track(&mut state)?;
@@ -94,6 +103,11 @@ fn main() -> Result<()> {
                         KeyCode::Char(' ') => toggle_pause(&mut state),
                         KeyCode::Char('n') => next_track(&mut state)?,
                         KeyCode::Char('p') => prev_track(&mut state)?,
+                        KeyCode::Char('t') => resort_playlist(&mut state, SortKey::Title),
+                        KeyCode::Char('a') => resort_playlist(&mut state, SortKey::Artist),
+                        KeyCode::Char('l') => resort_playlist(&mut state, SortKey::Album),
+                        KeyCode::Char('s') => resort_playlist(&mut state, SortKey::Path),
+                        KeyCode::Char('r') => toggle_reverse(&mut state),
                         _ => {}
                     }
                 }
@@ -139,6 +153,9 @@ fn parse_args() -> Result<Args> {
                     "path" => SortKey::Path,
                     "name" => SortKey::Name,
                     "mtime" => SortKey::Mtime,
+                    "title" => SortKey::Title,
+                    "artist" => SortKey::Artist,
+                    "album" => SortKey::Album,
                     _ => anyhow::bail!("Unknown sort key '{}'", key),
                 };
             }
@@ -151,15 +168,18 @@ fn parse_args() -> Result<Args> {
         }
     }
 
-    let path = path.context("Usage: bu-rust-mp3 [--sort path|name|mtime] [--reverse] <file.mp3|directory>")?;
+    let path = path.context("Usage: bu-rust-mp3 [--sort path|name|mtime|title|artist|album] [--reverse] <file.mp3|directory>")?;
     Ok(Args { path, sort, reverse })
 }
 
 fn collect_tracks(args: &Args) -> Result<Vec<Track>> {
     if args.path.is_file() {
+        let meta = read_meta(&args.path);
         return Ok(vec![Track {
             path: args.path.to_path_buf(),
-            title: read_title(&args.path),
+            title: meta.title,
+            artist: meta.artist,
+            album: meta.album,
         }]);
     }
 
@@ -172,9 +192,12 @@ fn collect_tracks(args: &Args) -> Result<Vec<Track>> {
                 .map(|s| s.eq_ignore_ascii_case("mp3"))
                 .unwrap_or(false)
             {
+                let meta = read_meta(p);
                 tracks.push(Track {
                     path: p.into(),
-                    title: read_title(p),
+                    title: meta.title,
+                    artist: meta.artist,
+                    album: meta.album,
                 });
             }
         }
@@ -199,24 +222,62 @@ fn sort_tracks(tracks: &mut [Track], sort: SortKey, reverse: bool) {
                 .and_then(|m| m.modified())
                 .unwrap_or(UNIX_EPOCH)
         }),
+        SortKey::Title => tracks.sort_by_key(|t| meta_key(t.title.as_deref(), &t.path)),
+        SortKey::Artist => tracks.sort_by_key(|t| meta_key(t.artist.as_deref(), &t.path)),
+        SortKey::Album => tracks.sort_by_key(|t| meta_key(t.album.as_deref(), &t.path)),
     }
     if reverse {
         tracks.reverse();
     }
 }
 
-fn read_title(path: &Path) -> Option<String> {
-    let tag = Tag::read_from_path(path).ok()?;
-    let title = tag.title()?.trim().to_string();
-    if title.is_empty() {
+struct TrackMeta {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+}
+
+fn read_meta(path: &Path) -> TrackMeta {
+    let tag = match Tag::read_from_path(path) {
+        Ok(tag) => tag,
+        Err(_) => {
+            return TrackMeta {
+                title: None,
+                artist: None,
+                album: None,
+            }
+        }
+    };
+    TrackMeta {
+        title: clean_opt(tag.title()),
+        artist: clean_opt(tag.artist()),
+        album: clean_opt(tag.album()),
+    }
+}
+
+fn clean_opt(value: Option<&str>) -> Option<String> {
+    let v = value?.trim();
+    if v.is_empty() {
         None
     } else {
-        Some(title)
+        Some(v.to_string())
+    }
+}
+
+fn meta_key(value: Option<&str>, path: &Path) -> String {
+    let v = value.unwrap_or("").trim();
+    if v.is_empty() {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    } else {
+        v.to_ascii_lowercase()
     }
 }
 
 fn print_usage() {
-    println!("Usage: bu-rust-mp3 [--sort path|name|mtime] [--reverse] <file.mp3|directory>");
+    println!("Usage: bu-rust-mp3 [--sort path|name|mtime|title|artist|album] [--reverse] <file.mp3|directory>");
     println!("Sort defaults to path. Use --reverse to invert order.");
 }
 
@@ -358,8 +419,36 @@ fn draw_ui(f: &mut Frame, state: &PlayerState) {
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Playlist"));
     f.render_widget(list, chunks[3]);
 
-    let help = Paragraph::new("Controls: space play/pause | n next | p previous | q quit");
+    let help = Paragraph::new(
+        "Controls: space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | q quit",
+    );
     f.render_widget(help, chunks[4]);
+}
+
+fn resort_playlist(state: &mut PlayerState, sort: SortKey) {
+    let current_path = state.tracks[state.current].path.clone();
+    state.sort_key = sort;
+    sort_tracks(&mut state.tracks, state.sort_key, state.sort_reverse);
+    if let Some(idx) = state
+        .tracks
+        .iter()
+        .position(|t| t.path == current_path)
+    {
+        state.current = idx;
+    }
+}
+
+fn toggle_reverse(state: &mut PlayerState) {
+    let current_path = state.tracks[state.current].path.clone();
+    state.sort_reverse = !state.sort_reverse;
+    sort_tracks(&mut state.tracks, state.sort_key, state.sort_reverse);
+    if let Some(idx) = state
+        .tracks
+        .iter()
+        .position(|t| t.path == current_path)
+    {
+        state.current = idx;
+    }
 }
 
 fn fmt_duration(d: Duration) -> String {
