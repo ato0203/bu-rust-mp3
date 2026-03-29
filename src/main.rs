@@ -246,6 +246,12 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
                         KeyCode::Char('l') => resort_playlist(&mut state, SortKey::Album),
                         KeyCode::Char('s') => resort_playlist(&mut state, SortKey::Path),
                         KeyCode::Char('r') => toggle_reverse(&mut state),
+                        KeyCode::Char('R') | KeyCode::F(5) => {
+                            refresh_playlist(&mut state, terminal)?;
+                            clear_kitty_image(terminal.backend_mut()).ok();
+                            kitty_drawn = false;
+                            last_art_sig = None;
+                        }
                         KeyCode::Char('k') => state.force_kitty = !state.force_kitty,
                         KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.ui_mode = UiMode::Playlist;
@@ -668,6 +674,55 @@ fn draw_loading_ui(f: &mut Frame, playlist_path: &Path, track_count: usize) {
     f.render_widget(widget, area);
 }
 
+fn refresh_playlist(
+    state: &mut PlayerState,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<()> {
+    let args = Args {
+        path: state.playlist_path.clone(),
+        sort: state.sort_key,
+        reverse: state.sort_reverse,
+    };
+    let scanned = scan_playlist(&args)?;
+    if scanned.is_empty() {
+        anyhow::bail!("No .mp3 files found in {}", state.playlist_path.display());
+    }
+
+    terminal
+        .draw(|f| draw_loading_ui(f, &state.playlist_path, scanned.len()))
+        .context("draw loading UI")?;
+
+    let current_path = state.tracks.get(state.current).map(|t| t.path.clone());
+    let selected_path = state.tracks.get(state.selected).map(|t| t.path.clone());
+    let tracks = build_tracks_from_scan(&args, &scanned);
+    let cache_path = playlist_cache_path(&state.playlist_path);
+    save_playlist_cache(&cache_path, &state.playlist_path, &scanned, &tracks).ok();
+
+    state.tracks = tracks;
+
+    if let Some(path) = current_path {
+        if let Some(index) = state.tracks.iter().position(|track| track.path == path) {
+            state.current = index;
+        } else {
+            state.current = state.selected.min(state.tracks.len().saturating_sub(1));
+            load_track(state)?;
+        }
+    }
+
+    if let Some(path) = selected_path {
+        if let Some(index) = state.tracks.iter().position(|track| track.path == path) {
+            state.selected = index;
+        } else {
+            state.selected = state.current.min(state.tracks.len().saturating_sub(1));
+        }
+    } else {
+        state.selected = state.current.min(state.tracks.len().saturating_sub(1));
+    }
+
+    save_resume_state(state).ok();
+    Ok(())
+}
+
 fn load_track(state: &mut PlayerState) -> Result<()> {
     state.sink.stop();
     state.sink = Sink::try_new(&state.stream_handle).context("audio sink")?;
@@ -926,7 +981,7 @@ fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
     f.render_stateful_widget(list, chunks[4], &mut list_state);
 
     let help = Paragraph::new(
-        "Controls: / search | up/down move | enter play selected | esc clear search | space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
+        "Controls: / search | up/down move | enter play selected | esc clear search | space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | R/F5 refresh | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
     );
     f.render_widget(help, chunks[5]);
     DrawInfo::default()
@@ -1035,7 +1090,7 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
     f.render_widget(gauge, chunks[3]);
 
     let help = Paragraph::new(
-        "Controls: space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | k kitty | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
+        "Controls: space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | R/F5 refresh | k kitty | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
     );
     f.render_widget(help, chunks[4]);
 
