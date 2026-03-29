@@ -1051,8 +1051,7 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
     f.render_widget(art_block, chunks[2]);
 
     let use_kitty = (supports_kitty || state.force_kitty) && track.art_png.is_some();
-    let square = art_inner.width.min(art_inner.height);
-    let art_rect = center_rect(art_inner, square, square);
+    let art_rect = square_art_rect(art_inner);
     if !use_kitty {
         if let Some(png) = track.art_png.as_deref() {
             if let Some(lines) = ascii_art_lines(png, art_rect.width, art_rect.height) {
@@ -1148,6 +1147,36 @@ fn center_rect(area: Rect, width: u16, height: u16) -> Rect {
         width: w,
         height: h,
     }
+}
+
+fn square_art_rect(area: Rect) -> Rect {
+    let Some(cell_aspect_ratio) = terminal_cell_aspect_ratio() else {
+        let square = area.width.min(area.height);
+        return center_rect(area, square, square);
+    };
+
+    let max_height_by_width = (area.width as f32 / cell_aspect_ratio).floor() as u16;
+    let height = area.height.min(max_height_by_width).max(1);
+    let width = ((height as f32) * cell_aspect_ratio)
+        .round()
+        .clamp(1.0, area.width as f32) as u16;
+
+    center_rect(area, width, height)
+}
+
+fn terminal_cell_aspect_ratio() -> Option<f32> {
+    let window = crossterm::terminal::window_size().ok()?;
+    if window.columns == 0 || window.rows == 0 || window.width == 0 || window.height == 0 {
+        return None;
+    }
+
+    let cell_width = window.width as f32 / window.columns as f32;
+    let cell_height = window.height as f32 / window.rows as f32;
+    if cell_width <= 0.0 || cell_height <= 0.0 {
+        return None;
+    }
+
+    Some(cell_height / cell_width)
 }
 
 fn supports_kitty() -> bool {
