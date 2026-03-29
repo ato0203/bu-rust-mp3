@@ -7,21 +7,26 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use id3::{Tag, TagLike};
-use image::ImageFormat;
+use image::{GenericImageView, ImageFormat};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph},
 };
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::{
-    env,
+    env, fs,
     fs::File,
     io::{self, BufReader},
     path::{Path, PathBuf},
     time::{Duration, Instant, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
+
+const ALBUM_ART_SIZE_PX: u32 = 400;
+const CACHE_VERSION: u32 = 1;
+const CACHE_APP_DIR: &str = "bu-rust-mp3";
 
 struct Track {
     path: PathBuf,
@@ -53,6 +58,31 @@ struct Args {
     reverse: bool,
 }
 
+#[derive(Clone)]
+struct ScannedTrack {
+    path: PathBuf,
+    size: u64,
+    modified_unix_secs: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PlaylistCache {
+    version: u32,
+    playlist: String,
+    entries: Vec<CachedTrack>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedTrack {
+    path: String,
+    size: u64,
+    modified_unix_secs: u64,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    art_png_base64: Option<String>,
+}
+
 struct PlayerState {
     tracks: Vec<Track>,
     current: usize,
@@ -77,19 +107,41 @@ struct ArtSig {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let tracks = collect_tracks(&args)?;
-    if tracks.is_empty() {
-        anyhow::bail!("No .mp3 files found in {}", args.path.display());
-    }
-
-    let (_stream, stream_handle) = OutputStream::try_default().context("audio output")?;
-    let sink = Sink::try_new(&stream_handle).context("audio sink")?;
-
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("enter alt screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("terminal")?;
+
+    let result = run_app(args, &mut terminal);
+
+    disable_raw_mode().ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    terminal.show_cursor().ok();
+
+    result
+}
+
+fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    let scanned = scan_playlist(&args)?;
+    if scanned.is_empty() {
+        anyhow::bail!("No .mp3 files found in {}", args.path.display());
+    }
+
+    let cache_path = playlist_cache_path(&args.path);
+    let tracks = if let Some(tracks) = load_cached_tracks(&cache_path, &args, &scanned)? {
+        tracks
+    } else {
+        terminal
+            .draw(|f| draw_loading_ui(f, &args.path, scanned.len()))
+            .context("draw loading UI")?;
+        let tracks = build_tracks_from_scan(&args, &scanned);
+        save_playlist_cache(&cache_path, &args.path, &scanned, &tracks).ok();
+        tracks
+    };
+
+    let (_stream, stream_handle) = OutputStream::try_default().context("audio output")?;
+    let sink = Sink::try_new(&stream_handle).context("audio sink")?;
 
     let mut state = PlayerState {
         tracks,
@@ -185,10 +237,6 @@ fn main() -> Result<()> {
         }
     }
 
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
-    terminal.show_cursor().ok();
-
     Ok(())
 }
 
@@ -234,19 +282,12 @@ fn parse_args() -> Result<Args> {
     })
 }
 
-fn collect_tracks(args: &Args) -> Result<Vec<Track>> {
+fn scan_playlist(args: &Args) -> Result<Vec<ScannedTrack>> {
     if args.path.is_file() {
-        let meta = read_meta(&args.path);
-        return Ok(vec![Track {
-            path: args.path.to_path_buf(),
-            title: meta.title,
-            artist: meta.artist,
-            album: meta.album,
-            art_png: meta.art_png,
-        }]);
+        return Ok(vec![scan_track(&args.path)?]);
     }
 
-    let mut tracks = Vec::new();
+    let mut scanned = Vec::new();
     for entry in WalkDir::new(&args.path).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             let p = entry.path();
@@ -255,19 +296,172 @@ fn collect_tracks(args: &Args) -> Result<Vec<Track>> {
                 .map(|s| s.eq_ignore_ascii_case("mp3"))
                 .unwrap_or(false)
             {
-                let meta = read_meta(p);
-                tracks.push(Track {
-                    path: p.into(),
-                    title: meta.title,
-                    artist: meta.artist,
-                    album: meta.album,
-                    art_png: meta.art_png,
-                });
+                scanned.push(scan_track(p)?);
             }
         }
     }
+    scanned.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(scanned)
+}
+
+fn scan_track(path: &Path) -> Result<ScannedTrack> {
+    let meta = path
+        .metadata()
+        .with_context(|| format!("read metadata for {}", path.display()))?;
+    let modified_unix_secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(ScannedTrack {
+        path: path.to_path_buf(),
+        size: meta.len(),
+        modified_unix_secs,
+    })
+}
+
+fn build_tracks_from_scan(args: &Args, scanned: &[ScannedTrack]) -> Vec<Track> {
+    let mut tracks = scanned
+        .iter()
+        .map(|entry| {
+            let meta = read_meta(&entry.path);
+            Track {
+                path: entry.path.clone(),
+                title: meta.title,
+                artist: meta.artist,
+                album: meta.album,
+                art_png: meta.art_png,
+            }
+        })
+        .collect::<Vec<_>>();
     sort_tracks(&mut tracks, args.sort, args.reverse);
-    Ok(tracks)
+    tracks
+}
+
+fn load_cached_tracks(
+    cache_path: &Path,
+    args: &Args,
+    scanned: &[ScannedTrack],
+) -> Result<Option<Vec<Track>>> {
+    let text = match fs::read_to_string(cache_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read cache {}", cache_path.display()));
+        }
+    };
+
+    let cache: PlaylistCache = match serde_json::from_str(&text) {
+        Ok(cache) => cache,
+        Err(_) => return Ok(None),
+    };
+    if cache.version != CACHE_VERSION {
+        return Ok(None);
+    }
+    if cache.entries.len() != scanned.len() {
+        return Ok(None);
+    }
+    for (entry, scanned_track) in cache.entries.iter().zip(scanned) {
+        if entry.path != scanned_track.path.to_string_lossy()
+            || entry.size != scanned_track.size
+            || entry.modified_unix_secs != scanned_track.modified_unix_secs
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut tracks = cache
+        .entries
+        .into_iter()
+        .map(|entry| Track {
+            path: PathBuf::from(entry.path),
+            title: entry.title,
+            artist: entry.artist,
+            album: entry.album,
+            art_png: entry.art_png_base64.and_then(decode_art_png),
+        })
+        .collect::<Vec<_>>();
+    sort_tracks(&mut tracks, args.sort, args.reverse);
+    Ok(Some(tracks))
+}
+
+fn save_playlist_cache(
+    cache_path: &Path,
+    playlist_path: &Path,
+    scanned: &[ScannedTrack],
+    tracks: &[Track],
+) -> Result<()> {
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create cache dir {}", parent.display()))?;
+    }
+
+    let entries = scanned
+        .iter()
+        .map(|entry| {
+            let track = tracks
+                .iter()
+                .find(|track| track.path == entry.path)
+                .expect("scan and tracks should contain the same files");
+            CachedTrack {
+                path: entry.path.to_string_lossy().into_owned(),
+                size: entry.size,
+                modified_unix_secs: entry.modified_unix_secs,
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+                album: track.album.clone(),
+                art_png_base64: track.art_png.as_deref().map(encode_art_png),
+            }
+        })
+        .collect();
+
+    let cache = PlaylistCache {
+        version: CACHE_VERSION,
+        playlist: playlist_path.to_string_lossy().into_owned(),
+        entries,
+    };
+    let json = serde_json::to_string(&cache).context("serialize playlist cache")?;
+    fs::write(cache_path, json).with_context(|| format!("write cache {}", cache_path.display()))
+}
+
+fn playlist_cache_path(path: &Path) -> PathBuf {
+    cache_root()
+        .join(CACHE_APP_DIR)
+        .join(format!("{}.json", encode_cache_key(path)))
+}
+
+fn cache_root() -> PathBuf {
+    if let Some(path) = env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path);
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join(".cache");
+    }
+    env::temp_dir()
+}
+
+fn encode_cache_key(path: &Path) -> String {
+    let key = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut out = String::with_capacity(key.len() * 2);
+    for byte in key.bytes() {
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{:02x}", byte));
+    }
+    out
+}
+
+fn encode_art_png(png: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(png)
+}
+
+fn decode_art_png(encoded: String) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
 }
 
 fn sort_tracks(tracks: &mut [Track], sort: SortKey, reverse: bool) {
@@ -351,6 +545,15 @@ fn extract_cover_png(tag: &Tag) -> Option<Vec<u8>> {
         .or_else(|| tag.pictures().next())?;
 
     let img = image::load_from_memory(&pic.data).ok()?;
+    let (w, h) = img.dimensions();
+    let size = w.min(h);
+    let x = (w - size) / 2;
+    let y = (h - size) / 2;
+    let img = img.crop_imm(x, y, size, size).resize_exact(
+        ALBUM_ART_SIZE_PX,
+        ALBUM_ART_SIZE_PX,
+        image::imageops::FilterType::Lanczos3,
+    );
     let mut png = Vec::new();
     if img
         .write_to(&mut io::Cursor::new(&mut png), ImageFormat::Png)
@@ -367,6 +570,19 @@ fn print_usage() {
         "Usage: bu-rust-mp3 [--sort path|name|mtime|title|artist|album] [--reverse] <file.mp3|directory>"
     );
     println!("Sort defaults to path. Use --reverse to invert order.");
+}
+
+fn draw_loading_ui(f: &mut Frame, playlist_path: &Path, track_count: usize) {
+    let area = center_rect(f.size(), 56, 7);
+    let widget = Paragraph::new(format!(
+        "Loading playlist...\n{}\nScanning {} track(s) and building cache",
+        playlist_path.display(),
+        track_count
+    ))
+    .alignment(Alignment::Center)
+    .block(Block::default().borders(Borders::ALL).title("bu-rust-mp3"));
+    f.render_widget(Clear, area);
+    f.render_widget(widget, area);
 }
 
 fn load_track(state: &mut PlayerState) -> Result<()> {
