@@ -10,7 +10,7 @@ use id3::{Tag, TagLike};
 use image::{GenericImageView, ImageFormat};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
 };
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use std::{
 use walkdir::WalkDir;
 
 const ALBUM_ART_SIZE_PX: u32 = 400;
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const CACHE_APP_DIR: &str = "bu-rust-mp3";
 const RESUME_STATE_VERSION: u32 = 1;
 
@@ -34,6 +34,7 @@ struct Track {
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
+    lyrics: Option<String>,
     art_png: Option<Vec<u8>>,
 }
 
@@ -81,6 +82,7 @@ struct CachedTrack {
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
+    lyrics: Option<String>,
     art_png_base64: Option<String>,
 }
 
@@ -99,6 +101,8 @@ struct PlayerState {
     search_query: String,
     search_mode: bool,
     show_help: bool,
+    show_lyrics: bool,
+    lyrics_scroll: u16,
     paused: bool,
     started_at: Option<Instant>,
     elapsed_before_pause: Duration,
@@ -165,6 +169,8 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
         search_query: String::new(),
         search_mode: false,
         show_help: false,
+        show_lyrics: false,
+        lyrics_scroll: 0,
         paused: false,
         started_at: None,
         elapsed_before_pause: Duration::ZERO,
@@ -230,6 +236,25 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
                         }
                         continue;
                     }
+                    if state.show_lyrics {
+                        match key.code {
+                            KeyCode::Char('l') | KeyCode::Esc | KeyCode::Enter => {
+                                state.show_lyrics = false;
+                                state.lyrics_scroll = 0;
+                            }
+                            KeyCode::Up => scroll_lyrics(&mut state, -1),
+                            KeyCode::Down => scroll_lyrics(&mut state, 1),
+                            KeyCode::PageUp => scroll_lyrics(&mut state, -8),
+                            KeyCode::PageDown => scroll_lyrics(&mut state, 8),
+                            KeyCode::Home => state.lyrics_scroll = 0,
+                            KeyCode::End => {
+                                state.lyrics_scroll =
+                                    max_lyrics_scroll(&state.tracks[state.current]);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if state.ui_mode == UiMode::Playlist
                         && handle_playlist_search_key(&mut state, key)?
                     {
@@ -238,6 +263,10 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('?') => state.show_help = true,
+                        KeyCode::Char('l') => {
+                            state.show_lyrics = true;
+                            state.lyrics_scroll = 0;
+                        }
                         KeyCode::Char(' ') => toggle_pause(&mut state),
                         KeyCode::Char('/') if state.ui_mode == UiMode::Playlist => {
                             state.search_mode = true;
@@ -255,7 +284,7 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
                         KeyCode::Char('p') => prev_track(&mut state)?,
                         KeyCode::Char('t') => resort_playlist(&mut state, SortKey::Title),
                         KeyCode::Char('a') => resort_playlist(&mut state, SortKey::Artist),
-                        KeyCode::Char('l') => resort_playlist(&mut state, SortKey::Album),
+                        KeyCode::Char('L') => resort_playlist(&mut state, SortKey::Album),
                         KeyCode::Char('s') => resort_playlist(&mut state, SortKey::Path),
                         KeyCode::Char('r') => toggle_reverse(&mut state),
                         KeyCode::Char('R') | KeyCode::F(5) => {
@@ -384,6 +413,7 @@ fn build_tracks_from_scan(args: &Args, scanned: &[ScannedTrack]) -> Vec<Track> {
                 title: meta.title,
                 artist: meta.artist,
                 album: meta.album,
+                lyrics: meta.lyrics,
                 art_png: meta.art_png,
             }
         })
@@ -432,6 +462,7 @@ fn load_cached_tracks(
             title: entry.title,
             artist: entry.artist,
             album: entry.album,
+            lyrics: entry.lyrics,
             art_png: entry.art_png_base64.and_then(decode_art_png),
         })
         .collect::<Vec<_>>();
@@ -464,6 +495,7 @@ fn save_playlist_cache(
                 title: track.title.clone(),
                 artist: track.artist.clone(),
                 album: track.album.clone(),
+                lyrics: track.lyrics.clone(),
                 art_png_base64: track.art_png.as_deref().map(encode_art_png),
             }
         })
@@ -594,6 +626,7 @@ struct TrackMeta {
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
+    lyrics: Option<String>,
     art_png: Option<Vec<u8>>,
 }
 
@@ -605,6 +638,7 @@ fn read_meta(path: &Path) -> TrackMeta {
                 title: None,
                 artist: None,
                 album: None,
+                lyrics: None,
                 art_png: None,
             };
         }
@@ -614,6 +648,7 @@ fn read_meta(path: &Path) -> TrackMeta {
         title: clean_opt(tag.title()),
         artist: clean_opt(tag.artist()),
         album: clean_opt(tag.album()),
+        lyrics: extract_lyrics(&tag),
         art_png,
     }
 }
@@ -666,6 +701,11 @@ fn extract_cover_png(tag: &Tag) -> Option<Vec<u8>> {
     }
 }
 
+fn extract_lyrics(tag: &Tag) -> Option<String> {
+    tag.lyrics()
+        .find_map(|lyrics| clean_opt(Some(lyrics.text.as_str())))
+}
+
 fn print_usage() {
     println!(
         "Usage: bu-rust-mp3 [--sort path|name|mtime|title|artist|album] [--reverse] <file.mp3|directory>"
@@ -694,13 +734,14 @@ fn draw_help_popup(f: &mut Frame) {
         "space  play / pause",
         "p      previous track",
         "n      next track",
+        "l      show current lyrics",
         "/      search playlist",
         "up/down move playlist cursor",
         "enter  play selected track",
         "esc    clear search / close help",
         "t      sort by title",
         "a      sort by artist",
-        "l      sort by album",
+        "L      sort by album",
         "s      sort by path",
         "r      toggle reverse sort",
         "R/F5   refresh playlist",
@@ -717,6 +758,47 @@ fn draw_help_popup(f: &mut Frame) {
         .alignment(Alignment::Left);
     f.render_widget(Clear, area);
     f.render_widget(popup, area);
+}
+
+fn draw_lyrics_popup(f: &mut Frame, state: &PlayerState) {
+    let track = &state.tracks[state.current];
+    let area = center_rect(f.size(), 84, 28);
+    let title = track.title.as_deref().unwrap_or_else(|| {
+        track
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+    });
+    let content = track
+        .lyrics
+        .as_deref()
+        .unwrap_or("No lyrics found in MP3 metadata.");
+    let popup = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Lyrics | {}", title)),
+        )
+        .scroll((state.lyrics_scroll, 0))
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, area);
+    f.render_widget(popup, area);
+}
+
+fn scroll_lyrics(state: &mut PlayerState, delta: i16) {
+    let current = state.lyrics_scroll as i32;
+    let max_scroll = max_lyrics_scroll(&state.tracks[state.current]) as i32;
+    let next = (current + delta as i32).clamp(0, max_scroll);
+    state.lyrics_scroll = next as u16;
+}
+
+fn max_lyrics_scroll(track: &Track) -> u16 {
+    track
+        .lyrics
+        .as_deref()
+        .map(|lyrics| lyrics.lines().count().saturating_sub(24) as u16)
+        .unwrap_or(0)
 }
 
 fn refresh_playlist(
@@ -922,6 +1004,9 @@ fn draw_ui(f: &mut Frame, state: &PlayerState, supports_kitty: bool) -> DrawInfo
     };
     if state.show_help {
         draw_help_popup(f);
+    }
+    if state.show_lyrics {
+        draw_lyrics_popup(f, state);
     }
     draw_info
 }
