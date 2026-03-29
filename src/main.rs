@@ -10,7 +10,7 @@ use id3::{Tag, TagLike};
 use image::{GenericImageView, ImageFormat};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
 };
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,7 @@ struct PlayerState {
     playlist_path: PathBuf,
     tracks: Vec<Track>,
     current: usize,
+    selected: usize,
     paused: bool,
     started_at: Option<Instant>,
     elapsed_before_pause: Duration,
@@ -157,6 +158,7 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
         playlist_path: playlist_path.clone(),
         tracks,
         current: 0,
+        selected: 0,
         paused: false,
         started_at: None,
         elapsed_before_pause: Duration::ZERO,
@@ -216,6 +218,15 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char(' ') => toggle_pause(&mut state),
+                        KeyCode::Up if state.ui_mode == UiMode::Playlist => {
+                            move_playlist_selection(&mut state, -1);
+                        }
+                        KeyCode::Down if state.ui_mode == UiMode::Playlist => {
+                            move_playlist_selection(&mut state, 1);
+                        }
+                        KeyCode::Enter if state.ui_mode == UiMode::Playlist => {
+                            play_selected_track(&mut state)?;
+                        }
                         KeyCode::Char('n') => next_track(&mut state)?,
                         KeyCode::Char('p') => prev_track(&mut state)?,
                         KeyCode::Char('t') => resort_playlist(&mut state, SortKey::Title),
@@ -502,6 +513,7 @@ fn restore_last_played_index(state: &mut PlayerState, playlist_path: &Path) {
         .position(|track| track.path.as_path() == last_track_path)
     {
         state.current = index;
+        state.selected = index;
     }
 }
 
@@ -657,6 +669,7 @@ fn load_track(state: &mut PlayerState) -> Result<()> {
     state.total_duration = decoder.total_duration();
     state.sink.append(decoder);
     state.sink.play();
+    state.selected = state.current;
     save_resume_state(state).ok();
     Ok(())
 }
@@ -699,6 +712,20 @@ fn advance_if_possible(state: &mut PlayerState) -> Result<bool> {
     } else {
         Ok(false)
     }
+}
+
+fn move_playlist_selection(state: &mut PlayerState, delta: isize) {
+    let last = state.tracks.len().saturating_sub(1) as isize;
+    let next = (state.selected as isize + delta).clamp(0, last);
+    state.selected = next as usize;
+}
+
+fn play_selected_track(state: &mut PlayerState) -> Result<()> {
+    if state.selected != state.current {
+        state.current = state.selected;
+        load_track(state)?;
+    }
+    Ok(())
 }
 
 fn current_elapsed(state: &PlayerState) -> Duration {
@@ -795,14 +822,29 @@ fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
                 .as_deref()
                 .unwrap_or_else(|| t.path.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
             let prefix = if i == state.current { "▶ " } else { "  " };
-            ListItem::new(format!("{}{}", prefix, name))
+            let text = if i == state.current {
+                format!("{}{}  [playing]", prefix, name)
+            } else {
+                format!("{}{}", prefix, name)
+            };
+            ListItem::new(text)
         })
         .collect::<Vec<_>>();
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Playlist"));
-    f.render_widget(list, chunks[3]);
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Playlist"))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected));
+    f.render_stateful_widget(list, chunks[3], &mut list_state);
 
     let help = Paragraph::new(
-        "Controls: space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
+        "Controls: up/down move | enter play selected | space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
     );
     f.render_widget(help, chunks[4]);
     DrawInfo::default()
@@ -923,19 +965,27 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
 
 fn resort_playlist(state: &mut PlayerState, sort: SortKey) {
     let current_path = state.tracks[state.current].path.clone();
+    let selected_path = state.tracks[state.selected].path.clone();
     state.sort_key = sort;
     sort_tracks(&mut state.tracks, state.sort_key, state.sort_reverse);
     if let Some(idx) = state.tracks.iter().position(|t| t.path == current_path) {
         state.current = idx;
     }
+    if let Some(idx) = state.tracks.iter().position(|t| t.path == selected_path) {
+        state.selected = idx;
+    }
 }
 
 fn toggle_reverse(state: &mut PlayerState) {
     let current_path = state.tracks[state.current].path.clone();
+    let selected_path = state.tracks[state.selected].path.clone();
     state.sort_reverse = !state.sort_reverse;
     sort_tracks(&mut state.tracks, state.sort_key, state.sort_reverse);
     if let Some(idx) = state.tracks.iter().position(|t| t.path == current_path) {
         state.current = idx;
+    }
+    if let Some(idx) = state.tracks.iter().position(|t| t.path == selected_path) {
+        state.selected = idx;
     }
 }
 
