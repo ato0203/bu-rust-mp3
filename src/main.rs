@@ -98,6 +98,7 @@ struct PlayerState {
     selected: usize,
     search_query: String,
     search_mode: bool,
+    show_help: bool,
     paused: bool,
     started_at: Option<Instant>,
     elapsed_before_pause: Duration,
@@ -163,6 +164,7 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
         selected: 0,
         search_query: String::new(),
         search_mode: false,
+        show_help: false,
         paused: false,
         started_at: None,
         elapsed_before_pause: Duration::ZERO,
@@ -219,6 +221,15 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
         if event::poll(timeout).context("poll event")? {
             if let Event::Key(key) = event::read().context("read event")? {
                 if key.kind == KeyEventKind::Press {
+                    if state.show_help {
+                        match key.code {
+                            KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => {
+                                state.show_help = false;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if state.ui_mode == UiMode::Playlist
                         && handle_playlist_search_key(&mut state, key)?
                     {
@@ -226,6 +237,7 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
                     }
                     match key.code {
                         KeyCode::Char('q') => break,
+                        KeyCode::Char('?') => state.show_help = true,
                         KeyCode::Char(' ') => toggle_pause(&mut state),
                         KeyCode::Char('/') if state.ui_mode == UiMode::Playlist => {
                             state.search_mode = true;
@@ -674,6 +686,39 @@ fn draw_loading_ui(f: &mut Frame, playlist_path: &Path, track_count: usize) {
     f.render_widget(widget, area);
 }
 
+fn draw_help_popup(f: &mut Frame) {
+    let area = center_rect(f.size(), 60, 22);
+    let content = [
+        "Available keys",
+        "",
+        "space  play / pause",
+        "p      previous track",
+        "n      next track",
+        "/      search playlist",
+        "up/down move playlist cursor",
+        "enter  play selected track",
+        "esc    clear search / close help",
+        "t      sort by title",
+        "a      sort by artist",
+        "l      sort by album",
+        "s      sort by path",
+        "r      toggle reverse sort",
+        "R/F5   refresh playlist",
+        "k      toggle kitty image mode",
+        "ctrl+1/F1 playlist view",
+        "ctrl+2/F2 now playing view",
+        "q      quit",
+        "",
+        "? / esc / enter close help",
+    ]
+    .join("\n");
+    let popup = Paragraph::new(content)
+        .block(Block::default().borders(Borders::ALL).title("Help"))
+        .alignment(Alignment::Left);
+    f.render_widget(Clear, area);
+    f.render_widget(popup, area);
+}
+
 fn refresh_playlist(
     state: &mut PlayerState,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -871,10 +916,14 @@ struct DrawInfo {
 }
 
 fn draw_ui(f: &mut Frame, state: &PlayerState, supports_kitty: bool) -> DrawInfo {
-    match state.ui_mode {
+    let draw_info = match state.ui_mode {
         UiMode::Playlist => draw_playlist(f, state),
         UiMode::NowPlaying => draw_now_playing(f, state, supports_kitty),
+    };
+    if state.show_help {
+        draw_help_popup(f);
     }
+    draw_info
 }
 
 fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
@@ -980,9 +1029,7 @@ fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
     list_state.select(Some(state.selected));
     f.render_stateful_widget(list, chunks[4], &mut list_state);
 
-    let help = Paragraph::new(
-        "Controls: / search | up/down move | enter play selected | esc clear search | space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | R/F5 refresh | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
-    );
+    let help = Paragraph::new("Controls: space play/pause | p prev | n next | ? help");
     f.render_widget(help, chunks[5]);
     DrawInfo::default()
 }
@@ -1088,9 +1135,7 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
     };
     f.render_widget(gauge, chunks[3]);
 
-    let help = Paragraph::new(
-        "Controls: space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | R/F5 refresh | k kitty | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
-    );
+    let help = Paragraph::new("Controls: space play/pause | p prev | n next | ? help");
     f.render_widget(help, chunks[4]);
 
     DrawInfo {
