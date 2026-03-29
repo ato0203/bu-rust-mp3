@@ -27,6 +27,7 @@ use walkdir::WalkDir;
 const ALBUM_ART_SIZE_PX: u32 = 400;
 const CACHE_VERSION: u32 = 1;
 const CACHE_APP_DIR: &str = "bu-rust-mp3";
+const RESUME_STATE_VERSION: u32 = 1;
 
 struct Track {
     path: PathBuf,
@@ -83,7 +84,15 @@ struct CachedTrack {
     art_png_base64: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct ResumeState {
+    version: u32,
+    playlist: String,
+    last_track_path: String,
+}
+
 struct PlayerState {
+    playlist_path: PathBuf,
     tracks: Vec<Track>,
     current: usize,
     paused: bool,
@@ -123,6 +132,7 @@ fn main() -> Result<()> {
 }
 
 fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    let playlist_path = args.path.clone();
     let scanned = scan_playlist(&args)?;
     if scanned.is_empty() {
         anyhow::bail!("No .mp3 files found in {}", args.path.display());
@@ -144,6 +154,7 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
     let sink = Sink::try_new(&stream_handle).context("audio sink")?;
 
     let mut state = PlayerState {
+        playlist_path: playlist_path.clone(),
         tracks,
         current: 0,
         paused: false,
@@ -158,6 +169,7 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
         force_kitty: env_force_kitty(),
     };
 
+    restore_last_played_index(&mut state, &playlist_path);
     load_track(&mut state)?;
 
     let tick_rate = Duration::from_millis(100);
@@ -431,6 +443,12 @@ fn playlist_cache_path(path: &Path) -> PathBuf {
         .join(format!("{}.json", encode_cache_key(path)))
 }
 
+fn resume_state_path(path: &Path) -> PathBuf {
+    cache_root()
+        .join(CACHE_APP_DIR)
+        .join(format!("{}.resume.json", encode_cache_key(path)))
+}
+
 fn cache_root() -> PathBuf {
     if let Some(path) = env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(path);
@@ -462,6 +480,47 @@ fn decode_art_png(encoded: String) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .ok()
+}
+
+fn restore_last_played_index(state: &mut PlayerState, playlist_path: &Path) {
+    let path = resume_state_path(playlist_path);
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return,
+    };
+    let resume: ResumeState = match serde_json::from_str(&text) {
+        Ok(resume) => resume,
+        Err(_) => return,
+    };
+    if resume.version != RESUME_STATE_VERSION {
+        return;
+    }
+    let last_track_path = Path::new(&resume.last_track_path);
+    if let Some(index) = state
+        .tracks
+        .iter()
+        .position(|track| track.path.as_path() == last_track_path)
+    {
+        state.current = index;
+    }
+}
+
+fn save_resume_state(state: &PlayerState) -> Result<()> {
+    let path = resume_state_path(&state.playlist_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create cache dir {}", parent.display()))?;
+    }
+    let resume = ResumeState {
+        version: RESUME_STATE_VERSION,
+        playlist: state.playlist_path.to_string_lossy().into_owned(),
+        last_track_path: state.tracks[state.current]
+            .path
+            .to_string_lossy()
+            .into_owned(),
+    };
+    let json = serde_json::to_string(&resume).context("serialize resume state")?;
+    fs::write(&path, json).with_context(|| format!("write resume state {}", path.display()))
 }
 
 fn sort_tracks(tracks: &mut [Track], sort: SortKey, reverse: bool) {
@@ -598,6 +657,7 @@ fn load_track(state: &mut PlayerState) -> Result<()> {
     state.total_duration = decoder.total_duration();
     state.sink.append(decoder);
     state.sink.play();
+    save_resume_state(state).ok();
     Ok(())
 }
 
