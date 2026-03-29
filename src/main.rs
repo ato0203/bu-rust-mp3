@@ -96,6 +96,8 @@ struct PlayerState {
     tracks: Vec<Track>,
     current: usize,
     selected: usize,
+    search_query: String,
+    search_mode: bool,
     paused: bool,
     started_at: Option<Instant>,
     elapsed_before_pause: Duration,
@@ -159,6 +161,8 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
         tracks,
         current: 0,
         selected: 0,
+        search_query: String::new(),
+        search_mode: false,
         paused: false,
         started_at: None,
         elapsed_before_pause: Duration::ZERO,
@@ -215,9 +219,17 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
         if event::poll(timeout).context("poll event")? {
             if let Event::Key(key) = event::read().context("read event")? {
                 if key.kind == KeyEventKind::Press {
+                    if state.ui_mode == UiMode::Playlist
+                        && handle_playlist_search_key(&mut state, key)?
+                    {
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char(' ') => toggle_pause(&mut state),
+                        KeyCode::Char('/') if state.ui_mode == UiMode::Playlist => {
+                            state.search_mode = true;
+                        }
                         KeyCode::Up if state.ui_mode == UiMode::Playlist => {
                             move_playlist_selection(&mut state, -1);
                         }
@@ -720,6 +732,65 @@ fn move_playlist_selection(state: &mut PlayerState, delta: isize) {
     state.selected = next as usize;
 }
 
+fn handle_playlist_search_key(
+    state: &mut PlayerState,
+    key: crossterm::event::KeyEvent,
+) -> Result<bool> {
+    if !state.search_mode {
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            state.search_mode = false;
+            state.search_query.clear();
+            Ok(true)
+        }
+        KeyCode::Enter => {
+            state.search_mode = false;
+            if state.search_query.is_empty() {
+                return play_selected_track(state).map(|_| true);
+            }
+            Ok(true)
+        }
+        KeyCode::Backspace => {
+            state.search_query.pop();
+            apply_search_selection(state);
+            Ok(true)
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.search_query.push(c);
+            apply_search_selection(state);
+            Ok(true)
+        }
+        _ => Ok(true),
+    }
+}
+
+fn apply_search_selection(state: &mut PlayerState) {
+    let query = state.search_query.trim();
+    if query.is_empty() {
+        return;
+    }
+    if let Some(index) = state
+        .tracks
+        .iter()
+        .position(|track| track_matches_query(track, query))
+    {
+        state.selected = index;
+    }
+}
+
+fn track_matches_query(track: &Track, query: &str) -> bool {
+    let query = query.to_ascii_lowercase();
+    let title = track.title.as_deref().unwrap_or("");
+    let artist = track.artist.as_deref().unwrap_or("");
+    let album = track.album.as_deref().unwrap_or("");
+    title.to_ascii_lowercase().contains(&query)
+        || artist.to_ascii_lowercase().contains(&query)
+        || album.to_ascii_lowercase().contains(&query)
+}
+
 fn play_selected_track(state: &mut PlayerState) -> Result<()> {
     if state.selected != state.current {
         state.current = state.selected;
@@ -758,6 +829,7 @@ fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
         .margin(1)
         .constraints(
             [
+                Constraint::Length(3),
                 Constraint::Length(3),
                 Constraint::Length(3),
                 Constraint::Length(3),
@@ -812,6 +884,16 @@ fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
     };
     f.render_widget(gauge, chunks[2]);
 
+    let search_label = if state.search_mode {
+        format!("Search: {}_", state.search_query)
+    } else if state.search_query.is_empty() {
+        "Search: /".to_string()
+    } else {
+        format!("Search: {}", state.search_query)
+    };
+    let search = Paragraph::new(search_label).block(Block::default().borders(Borders::ALL));
+    f.render_widget(search, chunks[3]);
+
     let items = state
         .tracks
         .iter()
@@ -841,12 +923,12 @@ fn draw_playlist(f: &mut Frame, state: &PlayerState) -> DrawInfo {
         .highlight_symbol("> ");
     let mut list_state = ListState::default();
     list_state.select(Some(state.selected));
-    f.render_stateful_widget(list, chunks[3], &mut list_state);
+    f.render_stateful_widget(list, chunks[4], &mut list_state);
 
     let help = Paragraph::new(
-        "Controls: up/down move | enter play selected | space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
+        "Controls: / search | up/down move | enter play selected | esc clear search | space play/pause | n next | p previous | t title | a artist | l album | s path | r reverse | ctrl+1/F1 playlist | ctrl+2/F2 now playing | q quit",
     );
-    f.render_widget(help, chunks[4]);
+    f.render_widget(help, chunks[5]);
     DrawInfo::default()
 }
 
