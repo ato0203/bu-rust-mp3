@@ -7,7 +7,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use id3::{Tag, TagLike};
-use image::{GenericImageView, ImageFormat};
+use image::ImageFormat;
 use prost::Message;
 use ratatui::{
     prelude::*,
@@ -24,8 +24,7 @@ use std::{
 };
 use walkdir::WalkDir;
 
-const ALBUM_ART_SIZE_PX: u32 = 400;
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 const CACHE_APP_DIR: &str = "bu-rust-mp3";
 const RESUME_STATE_VERSION: u32 = 1;
 
@@ -699,15 +698,6 @@ fn extract_cover_png(tag: &Tag) -> Option<Vec<u8>> {
         .or_else(|| tag.pictures().next())?;
 
     let img = image::load_from_memory(&pic.data).ok()?;
-    let (w, h) = img.dimensions();
-    let size = w.min(h);
-    let x = (w - size) / 2;
-    let y = (h - size) / 2;
-    let img = img.crop_imm(x, y, size, size).resize_exact(
-        ALBUM_ART_SIZE_PX,
-        ALBUM_ART_SIZE_PX,
-        image::imageops::FilterType::Lanczos3,
-    );
     let mut png = Vec::new();
     if img
         .write_to(&mut io::Cursor::new(&mut png), ImageFormat::Png)
