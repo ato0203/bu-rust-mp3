@@ -8,12 +8,12 @@ use crossterm::{
 };
 use id3::{Tag, TagLike};
 use image::{GenericImageView, ImageFormat};
+use prost::Message;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
 };
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::{
     env, fs,
@@ -67,29 +67,43 @@ struct ScannedTrack {
     modified_unix_secs: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Message)]
 struct PlaylistCache {
+    #[prost(uint32, tag = "1")]
     version: u32,
+    #[prost(string, tag = "2")]
     playlist: String,
+    #[prost(message, repeated, tag = "3")]
     entries: Vec<CachedTrack>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Message)]
 struct CachedTrack {
+    #[prost(string, tag = "1")]
     path: String,
+    #[prost(uint64, tag = "2")]
     size: u64,
+    #[prost(uint64, tag = "3")]
     modified_unix_secs: u64,
+    #[prost(string, optional, tag = "4")]
     title: Option<String>,
+    #[prost(string, optional, tag = "5")]
     artist: Option<String>,
+    #[prost(string, optional, tag = "6")]
     album: Option<String>,
+    #[prost(string, optional, tag = "7")]
     lyrics: Option<String>,
-    art_png_base64: Option<String>,
+    #[prost(bytes, optional, tag = "8")]
+    art_png: Option<Vec<u8>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Message)]
 struct ResumeState {
+    #[prost(uint32, tag = "1")]
     version: u32,
+    #[prost(string, tag = "2")]
     playlist: String,
+    #[prost(string, tag = "3")]
     last_track_path: String,
 }
 
@@ -427,15 +441,15 @@ fn load_cached_tracks(
     args: &Args,
     scanned: &[ScannedTrack],
 ) -> Result<Option<Vec<Track>>> {
-    let text = match fs::read_to_string(cache_path) {
-        Ok(text) => text,
+    let bytes = match fs::read(cache_path) {
+        Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
             return Err(err).with_context(|| format!("read cache {}", cache_path.display()));
         }
     };
 
-    let cache: PlaylistCache = match serde_json::from_str(&text) {
+    let cache = match PlaylistCache::decode(bytes.as_slice()) {
         Ok(cache) => cache,
         Err(_) => return Ok(None),
     };
@@ -463,7 +477,7 @@ fn load_cached_tracks(
             artist: entry.artist,
             album: entry.album,
             lyrics: entry.lyrics,
-            art_png: entry.art_png_base64.and_then(decode_art_png),
+            art_png: entry.art_png,
         })
         .collect::<Vec<_>>();
     sort_tracks(&mut tracks, args.sort, args.reverse);
@@ -496,7 +510,7 @@ fn save_playlist_cache(
                 artist: track.artist.clone(),
                 album: track.album.clone(),
                 lyrics: track.lyrics.clone(),
-                art_png_base64: track.art_png.as_deref().map(encode_art_png),
+                art_png: track.art_png.clone(),
             }
         })
         .collect();
@@ -506,20 +520,20 @@ fn save_playlist_cache(
         playlist: playlist_path.to_string_lossy().into_owned(),
         entries,
     };
-    let json = serde_json::to_string(&cache).context("serialize playlist cache")?;
-    fs::write(cache_path, json).with_context(|| format!("write cache {}", cache_path.display()))
+    let bytes = cache.encode_to_vec();
+    fs::write(cache_path, bytes).with_context(|| format!("write cache {}", cache_path.display()))
 }
 
 fn playlist_cache_path(path: &Path) -> PathBuf {
     cache_root()
         .join(CACHE_APP_DIR)
-        .join(format!("{}.json", encode_cache_key(path)))
+        .join(format!("{}.pb", encode_cache_key(path)))
 }
 
 fn resume_state_path(path: &Path) -> PathBuf {
     cache_root()
         .join(CACHE_APP_DIR)
-        .join(format!("{}.resume.json", encode_cache_key(path)))
+        .join(format!("{}.resume.pb", encode_cache_key(path)))
 }
 
 fn cache_root() -> PathBuf {
@@ -545,23 +559,13 @@ fn encode_cache_key(path: &Path) -> String {
     out
 }
 
-fn encode_art_png(png: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(png)
-}
-
-fn decode_art_png(encoded: String) -> Option<Vec<u8>> {
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .ok()
-}
-
 fn restore_last_played_index(state: &mut PlayerState, playlist_path: &Path) {
     let path = resume_state_path(playlist_path);
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
         Err(_) => return,
     };
-    let resume: ResumeState = match serde_json::from_str(&text) {
+    let resume: ResumeState = match ResumeState::decode(bytes.as_slice()) {
         Ok(resume) => resume,
         Err(_) => return,
     };
@@ -593,8 +597,8 @@ fn save_resume_state(state: &PlayerState) -> Result<()> {
             .to_string_lossy()
             .into_owned(),
     };
-    let json = serde_json::to_string(&resume).context("serialize resume state")?;
-    fs::write(&path, json).with_context(|| format!("write resume state {}", path.display()))
+    let bytes = resume.encode_to_vec();
+    fs::write(&path, bytes).with_context(|| format!("write resume state {}", path.display()))
 }
 
 fn sort_tracks(tracks: &mut [Track], sort: SortKey, reverse: bool) {
