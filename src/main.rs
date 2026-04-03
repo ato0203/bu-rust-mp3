@@ -54,6 +54,12 @@ enum UiMode {
     NowPlaying,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArtViewMode {
+    AlbumArt,
+    AsciiArt,
+}
+
 struct Args {
     path: PathBuf,
     sort: SortKey,
@@ -127,6 +133,7 @@ struct PlayerState {
     sort_reverse: bool,
     ui_mode: UiMode,
     force_kitty: bool,
+    art_view_mode: ArtViewMode,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -195,6 +202,7 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
         sort_reverse: args.reverse,
         ui_mode: UiMode::Playlist,
         force_kitty: env_force_kitty(),
+        art_view_mode: ArtViewMode::AlbumArt,
     };
 
     restore_last_played_index(&mut state, &playlist_path);
@@ -308,6 +316,12 @@ fn run_app(args: Args, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) ->
                             last_art_sig = None;
                         }
                         KeyCode::Char('k') => state.force_kitty = !state.force_kitty,
+                        KeyCode::Char('b') if state.ui_mode == UiMode::NowPlaying => {
+                            state.art_view_mode = match state.art_view_mode {
+                                ArtViewMode::AlbumArt => ArtViewMode::AsciiArt,
+                                ArtViewMode::AsciiArt => ArtViewMode::AlbumArt,
+                            };
+                        }
                         KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.ui_mode = UiMode::Playlist;
                         }
@@ -739,6 +753,7 @@ fn draw_help_popup(f: &mut Frame) {
         "p      previous track",
         "n      next track",
         "l      show current lyrics",
+        "b      toggle album art / ASCII art",
         "/      search playlist",
         "up/down move playlist cursor",
         "enter  play selected track",
@@ -1175,9 +1190,13 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
     } else {
         "off"
     };
+    let art_view = match state.art_view_mode {
+        ArtViewMode::AlbumArt => "album art",
+        ArtViewMode::AsciiArt => "ascii",
+    };
     let info = format!(
-        "{}\nTitle : {}\nArtist: {}\nAlbum : {}\nArt   : {} | Kitty: {}",
-        status, display_title, artist, album, art_status, kitty_status
+        "{}\nTitle : {}\nArtist: {}\nAlbum : {}\nArt   : {} | View: {} | Kitty: {}",
+        status, display_title, artist, album, art_status, art_view, kitty_status
     );
     let info = Paragraph::new(info).block(Block::default().borders(Borders::ALL));
     f.render_widget(info, chunks[1]);
@@ -1186,16 +1205,33 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
     let art_inner = art_block.inner(chunks[2]);
     f.render_widget(art_block, chunks[2]);
 
-    let use_kitty = (supports_kitty || state.force_kitty) && track.art_png.is_some();
+    let use_kitty = state.art_view_mode == ArtViewMode::AlbumArt
+        && (supports_kitty || state.force_kitty)
+        && track.art_png.is_some();
     let art_rect = square_art_rect(art_inner);
     if !use_kitty {
         if let Some(png) = track.art_png.as_deref() {
-            if let Some(lines) = ascii_art_lines(png, art_rect.width, art_rect.height) {
-                let art = Paragraph::new(lines.join("\n"));
-                f.render_widget(art, art_rect);
-            } else {
-                let art = Paragraph::new("No art").alignment(Alignment::Center);
-                f.render_widget(art, art_rect);
+            match state.art_view_mode {
+                ArtViewMode::AsciiArt => {
+                    if let Some(lines) = ascii_art_lines(png, art_rect.width, art_rect.height) {
+                        let art = Paragraph::new(lines.join("\n"));
+                        f.render_widget(art, art_rect);
+                    } else {
+                        let art = Paragraph::new("No art").alignment(Alignment::Center);
+                        f.render_widget(art, art_rect);
+                    }
+                }
+                ArtViewMode::AlbumArt => {
+                    let message = if supports_kitty || state.force_kitty {
+                        "Album art unavailable"
+                    } else {
+                        "Album art view needs Kitty image support.\nPress b for ASCII art."
+                    };
+                    let art = Paragraph::new(message)
+                        .alignment(Alignment::Center)
+                        .wrap(Wrap { trim: true });
+                    f.render_widget(art, art_rect);
+                }
             }
         } else {
             let art = Paragraph::new("No art").alignment(Alignment::Center);
@@ -1224,7 +1260,8 @@ fn draw_now_playing(f: &mut Frame, state: &PlayerState, supports_kitty: bool) ->
     };
     f.render_widget(gauge, chunks[3]);
 
-    let help = Paragraph::new("Controls: space play/pause | p prev | n next | ? help");
+    let help =
+        Paragraph::new("Controls: space play/pause | p prev | n next | b art/ascii | ? help");
     f.render_widget(help, chunks[4]);
 
     DrawInfo {
